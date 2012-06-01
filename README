@@ -1,0 +1,31 @@
+AN!SCS; Safe Cluster Shutdown
+
+Author  - Madison Kelly (aka Digimer)
+Version - Pre-release
+
+This program is designed to be placed in /etc/rc.d/rc6.d/K00an-scs to ensure it
+runs prior to any component of the cluster shuts down.
+
+It's job is to safely migrate, or if not possible, shut down any running VMs.
+This script is needed because, on AN!Clusters, there are two rgmanager service
+types in parallel; Storage and the VMs themselves. When the rgmanager daemon is
+told to stop, it tries to stop parallel services at the same time. This can 
+cause problems because the storage fails to stop when the VMs are still 
+running.
+
+This program checks the VM's definition file for defined block devices. For 
+each block device found, a check is made to see what DRBD resources are used. 
+It then ensures that the peer's disk state and role are UpToDate and Primary,
+respectively. If they are, the VM is migrated to the peer. If for any reason
+these checks fail, the VM is gracefully shutdown.
+
+The program assumes the following;
+
+- Cluster running RHCS stable 3 (cman + corosync + rgmanager)
+- DRBD 8.3.x is used to back LVM.
+- Clustered LVM with LVs backing VMs.
+- KVM-based hypervisor (others may work)
+- VM managed by 'virsh' from 'libvirtd'.
+
+Specifically, this program was designed for: 
+- https://alteeve.com/w/2-Node_Red_Hat_KVM_Cluster_Tutorial

@@ -1,0 +1,437 @@
+#!/usr/bin/perl
+#
+# AN!SCS - Safe Cluster Shutdown
+# 
+# This is designed to be the first script called during a shutdown 
+# (/etc/rc.d/rc6.d/K00an-scs). It will migrate off VMs when possible, or
+# gracefully shut them down, before allowing rgmanager to be stopped.
+# 
+# Author:  mkelly@alteeve.ca
+# Version: v0.0.1
+# 
+
+use strict;
+use warnings;
+use IO::Handle;
+$|=1;
+
+# Hash
+my $conf={
+	path		=>	{
+		clustat		=>	"/usr/sbin/clustat",
+		clusvcadm	=>	"/usr/sbin/clusvcadm",
+# 		init_drbd	=>	"/etc/init.d/drbd",
+		drbdsetup	=>	"/sbin/drbdsetup",
+		lvdisplay	=>	"/sbin/lvdisplay",
+		virsh		=>	"/usr/bin/virsh",
+	},
+	'system'	=>	{
+		debug		=>	0,
+		do_cmd		=>	1,
+		proceed		=>	0,
+	},
+	node		=>	{
+		me		=>	{
+			name		=>	"",
+			rgmanager	=>	0,
+			cman		=>	0,
+			drbd		=>	{
+				role		=>	"",
+				disk_state	=>	"",
+			},
+		},
+		peer		=>	{
+			name		=>	"",
+			rgmanager	=>	0,
+			cman		=>	0,
+			drbd		=>	{
+				role		=>	"",
+				disk_state	=>	"",
+			},
+		},
+	},
+};
+
+print "Checking that the cluster is safe to stop.\n";
+
+# Check the current state of affairs.
+check_clustat($conf);
+
+if (not $conf->{'system'}{proceed})
+{
+	print " - Safe to proceed with shutdown.\n";
+	exit 0;
+}
+
+# Either shut down or migrate VMs.
+handle_vms($conf);
+
+# Proceed, if okat to do so.
+if (not $conf->{'system'}{proceed})
+{
+	print q|
+[ ERROR ]
+  I was unable to migrate or shut down one or more VMs!
+
+  -=] Blocking shutdown. [=-
+
+  Please open another terminal and gracefully stop the cluster. Once done,
+  press <ctrl> + <c> to kill this program and shutdown will proceed normally.
+|;
+	sleep;
+}
+# Who am I and who is my peer?
+#foreach my $key (sort {$a cmp $b} keys %ENV) { print "$key\t-\t$ENV{$key}\n"; }
+
+# Check for and, if needed, migrate running VMs.
+
+exit(0);
+
+sub handle_vms
+{
+	my ($conf)=@_;
+	
+	foreach my $vm (sort {$a cmp $b} keys %{$conf->{vm}})
+	{
+		my $vm_key=$vm;
+		$vm=~s/^vm://;
+		my $peer_is_ok=1;
+		print " - Verifying storage on peer node is ready for: [$vm]\n";
+		my $fh=IO::Handle->new();
+		my $sc="$conf->{path}{virsh} dumpxml $vm";
+		print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+		open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+		my $in_disk=0;
+		while(<$fh>)
+		{
+			chomp;
+			my $line=lc($_);
+			$line=~s/^\s+//;
+			$line=~s/\s+$//;
+			$line=~s/\s+/ /g;
+			next if not $line;
+			if (($line =~ /^<disk/) && ($line =~ /type='block'/) && ($line =~ /device='disk'/))
+			{
+				$in_disk=1;
+				next;
+			}
+			elsif ($line =~ /^<\/disk/)
+			{
+				$in_disk=0;
+				next;
+			}
+			next if not $in_disk;
+			if ($line =~ /source dev='(.*?)'/)
+			{
+				my $dev=$1;
+				$conf->{vm}{$vm_key}{disks}.="$dev,";
+			}
+# 			print "line: [$line]\n";
+		}
+		$fh->close();
+		$conf->{vm}{$vm_key}{disks}=~s/,$//;
+		foreach my $dev (sort {$a cmp $b} split /,/, $conf->{vm}{$vm_key}{disks})
+		{
+			print "   - Backing device: [$dev]\n";
+			my $fh=IO::Handle->new();
+			my $sc="$conf->{path}{lvdisplay} -m $dev";
+			print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+			open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+			my $in_disk=0;
+			while(<$fh>)
+			{
+				chomp;
+				my $line=lc($_);
+				$line=~s/^\s+//;
+				$line=~s/\s+$//;
+				$line=~s/\s+/ /g;
+				next if not $line;
+				#print "line: [$line]\n";
+				if ($line =~ /physical volume (.*)/)
+				{
+					my $pv=$1;
+					print "     - On physical volume: [$pv]\n";
+					my $fh=IO::Handle->new();
+					my $sc="$conf->{path}{drbdsetup} $pv status";
+					print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+					open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+					my $in_disk=0;
+					while(<$fh>)
+					{
+						chomp;
+						my $line=lc($_);
+						$line=~s/^\s+//;
+						$line=~s/\s+$//;
+						$line=~s/\s+/ /g;
+						next if not $line;
+						#print "line: [$line]\n";
+						if ($line =~ /cs="connected"/)
+						{
+							my ($peer_disk_state)=($line=~/ds2="(.*?)"/);
+							my ($peer_role)=($line=~/ro2="(.*?)"/);
+							
+							if (($peer_disk_state eq "uptodate") && ($peer_role eq "primary"))
+							{
+								print "       - Is Connected, UpToDate and Primary. Ready to receive.\n";
+							}
+							else
+							{
+								$peer_is_ok=0;
+								print "       - Is Connected but is in state: [$peer_disk_state/$peer_role] (need UpToDate/Primary)\n";
+								print "       - I am unable to migrate, will shut down this VM.\n";
+							}
+						}
+						else
+						{
+							print "       - Is disconnected! Unable to migrate, will shut down this VM.\n";
+							$peer_is_ok=0;
+						}
+					}
+					$fh->close();
+				}
+			}
+			$fh->close();
+		}
+		if ($peer_is_ok)
+		{
+			# Migrate
+			migrate_vm($conf, $vm_key, $conf->{node}{peer}{name});
+		}
+		else
+		{
+			# Disable
+			disable_vm($conf, $vm_key, $conf->{node}{peer}{name});
+		}
+	}
+	
+	return(0);
+}
+
+# Peform migrations
+sub migrate_vm
+{
+	my ($conf, $vm, $target)=@_;
+	print " - Migrating: [$vm] to: [$conf->{node}{peer}{name}]\n";
+	print "   - Please be patient, this may take a few minutes.\n";
+	
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{clusvcadm} -M $vm -m $target";
+	print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+	my $success=0;
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		$line=~s/^\s+//;
+		$line=~s/\s+$//;
+		$line=~s/\s+/ /g;
+		next if not $line;
+# 		print "line: [$line]\n";
+		$success=1 if $line =~ /success$/;
+	}
+	$fh->close();
+	
+	if ($success)
+	{
+		print "   - Migration successful.\n";
+	}
+	else
+	{
+		$conf->{'system'}{proceed}=0;
+		print "[ ERROR ] - Failed to migrate: [$vm] to: [$target]\n";
+	}
+	
+	return(0);
+}
+
+# Disable VM
+sub disable_vm
+{
+	my ($conf, $vm, $target)=@_;
+	print " - Peer node unable to host: [$vm], shutting it down.\n";
+	print "  - Please be patient, this may take a few minutes.\n";
+	
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{clusvcadm} -d $vm";
+	print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+	my $success=0;
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		$line=~s/^\s+//;
+		$line=~s/\s+$//;
+		$line=~s/\s+/ /g;
+		next if not $line;
+# 		print "line: [$line]\n";
+		$success=1 if $line =~ /success$/;
+	}
+	$fh->close();
+	
+	if ($success)
+	{
+		print "  - Shutdown successful.\n";
+	}
+	else
+	{
+		$conf->{'system'}{proceed}=0;
+		print "[ ERROR ] - Failed to shutdown: [$vm]\n";
+	}
+	
+	return(0);
+}
+
+# Look through VM resources and any that are running locally need to be moved
+# to the peer, if possible.
+# sub migrate_servers
+# {
+# 	my ($conf)=@_;
+# 	
+# 	foreach my $vm (sort {$a cmp $b} keys %{$conf->{vm}})
+# 	{
+# 		if ($conf->{vm}{$vm}{host} eq $conf->{node}{me}{name})
+# 		{
+# 			# If my peer is up, migrate. Otherwise, gracefully
+# 			# disable the service.
+# 			if (($conf->{node}{peer}{cman}) && ($conf->{node}{peer}{rgmanager}))
+# 			{
+# 				# Migrate
+# 				migrate_vm($conf, $vm, $conf->{node}{peer}{name});
+# 			}
+# 			else
+# 			{
+# 				# Disable
+# 				disable_vm($conf, $vm, $conf->{node}{peer}{name});
+# 			}
+# 		}
+# 		else
+# 		{
+# 			print "[ NOTICE ] - VM: [$vm] is already on: [$conf->{vm}{$vm}{host}]\n";
+# 		}
+# 	}
+# 	
+# 	return (0);
+# }
+
+# Make sure the peer is ready to accept VMs. To do this, I need to know which
+# DRBD resources are UpToDate (to be checked per VM to migrate later).
+# sub get_drbd_state
+# {
+# 	my ($conf)=@_;
+# 	
+# 	# Read in the state of the DRBD resources.
+# 	print " - Reading my peer's DRBD state.\n";
+# 	my $fh=IO::Handle->new();
+# 	my $sc="$conf->{path}{init_drbd} status";
+# 	print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+# 	open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+# 	my $in_res=0;
+# 	while(<$fh>)
+# 	{
+# 		chomp;
+# 		my $line=lc($_);
+# 		$line=~s/^\s+//;
+# 		$line=~s/\s+$//;
+# 		$line=~s/\s+/ /g;
+# 		if ($line=~/^m:res/) { $in_res=1; next; }
+# 		next if not $in_res;
+# 		my ($minor, $res, $cs, $me_role, $peer_role, $me_ds, $peer_ds)=($line=~/^(\d+):(\w+) (\w+) (\w+)\/(\w+) (\w+)\/(\w+?)\s/);
+# # 		print "minor: [$minor], res: [$res], cs: [$cs], me_role: [$me_role], peer_role: [$peer_role], me_ds: [$me_ds], peer_ds: [$peer_ds]\n";
+# 		# Details about me
+# 		$conf->{node}{me}{drbd}{minor}{$minor}{role}         = $me_role;
+# 		$conf->{node}{me}{drbd}{minor}{$minor}{disk_state}   = $me_ds;
+# 		$conf->{node}{me}{drbd}{minor}{$minor}{res}          = $res;
+# 		# Details about my peer.
+# 		$conf->{node}{peer}{drbd}{minor}{$minor}{role}       = $me_role;
+# 		$conf->{node}{peer}{drbd}{minor}{$minor}{disk_state} = $me_ds;
+# 		$conf->{node}{peer}{drbd}{minor}{$minor}{res}        = $res;
+# 	}
+# 	$fh->close();
+# 	foreach my $minor (sort {$a cmp $b} keys %{$conf->{node}{peer}{drbd}{minor}})
+# 	{
+# 		print "   - Minor: [$minor], Res: [$conf->{node}{peer}{drbd}{minor}{$minor}{res}]; Peer is: [$conf->{node}{peer}{drbd}{minor}{$minor}{role}]/[$conf->{node}{peer}{drbd}{minor}{$minor}{disk_state}]\n";
+# 	}
+# 	
+# 	return (0);
+# }
+
+# Find out the current state of affairs.
+sub check_clustat
+{
+	my ($conf)=@_;
+	
+	my $fh=IO::Handle->new();
+	my $sc="$conf->{path}{clustat}";
+	print "[ DEBUG ] - Calling: [$sc]\n" if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") or die "Failed to call: [$sc]\n";
+	my $in_member=0;
+	my $in_service=0;
+	while(<$fh>)
+	{
+		chomp;
+		my $line=lc($_);
+		$line=~s/^\s+//;
+		$line=~s/\s+$//;
+		$line=~s/\s+/ /g;
+		next if not $line;
+		next if $line =~ /^-/;
+		
+		if ($line =~ /^member name/)
+		{
+			$in_member=1;
+			$in_service=0;
+			next;
+		}
+		elsif ($line =~ /^service name/)
+		{
+			$in_member=0;
+			$in_service=1;
+			next;
+		}
+		if ($in_member)
+		{
+			if ($line=~/local/)
+			{
+				($conf->{node}{me}{name}, undef, my $services) = (split/ /, $line, 3);
+				$services=~s/local//;
+				$services=~s/ //g;
+				$services=~s/,,/,/g;
+				$conf->{node}{me}{cman}=1      if $services =~ /online/;
+				$conf->{node}{me}{rgmanager}=1 if $services =~ /rgmanager/;
+				print "[ DEBUG ] - Me   -> [$conf->{node}{me}{name}]; cman: [$conf->{node}{me}{cman}], rgmanager: [$conf->{node}{me}{rgmanager}]\n" if $conf->{'system'}{debug};
+			}
+			else
+			{
+				($conf->{node}{peer}{name}, undef, my $services) = split/ /, $line, 3;
+				$services=~s/ //g;
+				$services=~s/,,/,/g;
+				$conf->{node}{peer}{cman}=1      if $services =~ /online/;
+				$conf->{node}{peer}{rgmanager}=1 if $services =~ /rgmanager/;
+				print "[ DEBUG ] - Peer -> [$conf->{node}{peer}{name}]; cman: [$conf->{node}{peer}{cman}], rgmanager: [$conf->{node}{peer}{rgmanager}]\n" if $conf->{'system'}{debug};
+			}
+		}
+		elsif ($in_service)
+		{
+			next if $line !~ /^vm:/;
+			my ($vm, $host, $state)=split/ /, $line, 3;
+			print "[ DEBUG ] - VM: [$vm] on: [$conf->{vm}{$vm}{host}] in state: [$conf->{vm}{$vm}{'state'}]\n" if $conf->{'system'}{debug};
+			if ($host eq $conf->{node}{me}{name})
+			{
+				print " - VM: [$vm] has to be migrated or shut down.\n";
+				$conf->{vm}{$vm}{host}     = $host;
+				$conf->{vm}{$vm}{'state'}  = $state;
+				$conf->{vm}{$vm}{disks}    = "";
+				$conf->{vm}{$vm}{drbd_res} = "";
+				$conf->{'system'}{proceed}=1;
+			}
+			else
+			{
+				print " - VM: [$vm] is not running here, ignoring.\n";
+			}
+		}
+	}
+	$fh->close();
+	
+}
